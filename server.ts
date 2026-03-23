@@ -1,7 +1,7 @@
 import express from 'express';
 import { createServer as createViteServer } from 'vite';
 import { db } from './server/firebase.js';
-import { collection, query, where, getDocs, addDoc, updateDoc, doc, serverTimestamp, orderBy } from 'firebase/firestore';
+import { collection, query, where, getDocs, addDoc, updateDoc, doc, serverTimestamp, orderBy, getDoc } from 'firebase/firestore';
 import path from 'path';
 import { GoogleGenAI, Type, FunctionDeclaration } from '@google/genai';
 
@@ -43,17 +43,24 @@ async function processBotReply(tenantId: string, convId: string, waNumberData: a
     }
     const ai = new GoogleGenAI({ apiKey });
 
-    // Fetch catalog
+    // Fetch catalog and AI settings
     const servicesRef = collection(db, `tenants/${tenantId}/services`);
     const partsRef = collection(db, `tenants/${tenantId}/parts`);
-    const [servicesSnap, partsSnap] = await Promise.all([
+    const aiSettingsRef = doc(db, `tenants/${tenantId}/settings`, 'ai_assistant');
+    
+    const [servicesSnap, partsSnap, aiSettingsSnap] = await Promise.all([
       getDocs(servicesRef),
-      getDocs(partsRef)
+      getDocs(partsRef),
+      getDoc(aiSettingsRef)
     ]);
+    
     const catalog = {
       services: servicesSnap.docs.map(doc => ({ id: doc.id, ...doc.data() } as any)),
       parts: partsSnap.docs.map(doc => ({ id: doc.id, ...doc.data() } as any))
     };
+    
+    const aiSettings = aiSettingsSnap.exists() ? aiSettingsSnap.data() : null;
+    const customBehavior = aiSettings?.behavior ? `\nComportamento Customizado:\n${aiSettings.behavior}\n` : '';
 
     // Fetch recent messages
     const messagesRef = collection(db, `whatsapp_conversations/${convId}/messages`);
@@ -63,17 +70,18 @@ async function processBotReply(tenantId: string, convId: string, waNumberData: a
 
     let prompt = `Você é um assistente virtual de uma oficina mecânica. 
 Responda de forma educada, prestativa e proativa. 
-Seu objetivo é ajudar o cliente, tirar dúvidas e, se possível, encaminhar para um orçamento.
+Seu objetivo é entender o que o cliente busca, tirar dúvidas e, se possível, perguntar se ele deseja um orçamento. Se ele confirmar que deseja, gere o orçamento.
 
-Informações da Oficina:
-- Serviços Disponíveis: ${catalog.services.map(s => s.name).join(', ')}
-- Peças em Estoque: ${catalog.parts.map(p => p.name).join(', ')}
-
-Diretrizes:
-1. Seja amigável e use emojis ocasionalmente para parecer humano.
-2. Se o cliente perguntar sobre um serviço que temos, confirme e ofereça um orçamento.
-3. Se o cliente pedir um orçamento, use a ferramenta generateQuote.
-4. Mantenha as respostas concisas, mas completas.
+Informações da Oficina (CATÁLOGO RESTRITO):
+- Serviços Disponíveis: ${catalog.services.length > 0 ? catalog.services.map(s => s.name).join(', ') : 'Nenhum serviço cadastrado no momento.'}
+- Peças em Estoque: ${catalog.parts.length > 0 ? catalog.parts.map(p => p.name).join(', ') : 'Nenhuma peça cadastrada no momento.'}
+${customBehavior}
+Diretrizes CRÍTICAS:
+1. VOCÊ SÓ PODE OFERECER OS SERVIÇOS E PEÇAS LISTADOS ACIMA. É ESTRITAMENTE PROIBIDO inventar, sugerir ou oferecer qualquer serviço ou peça que não esteja na lista "Informações da Oficina".
+2. Se o cliente pedir algo que não está na lista, diga educadamente que no momento a oficina não oferece esse serviço/peça.
+3. Fluxo de atendimento: Entenda o problema -> Verifique se temos o serviço/peça -> Pergunte se o cliente deseja um orçamento -> Se SIM, use a ferramenta generateQuote.
+4. Se o cliente pedir um orçamento, use a ferramenta generateQuote APENAS com os itens do catálogo.
+5. Seja amigável e conciso.
 
 Histórico da conversa:\n`;
 
@@ -88,7 +96,7 @@ Histórico da conversa:\n`;
       contents: prompt,
       config: {
         tools: [{ functionDeclarations: [generateQuoteFunctionDeclaration] }],
-        systemInstruction: "Você é o assistente virtual da oficina. Use o contexto da oficina e da conversa para responder de forma proativa. Se o cliente demonstrar interesse em um serviço ou peça, tente converter em um orçamento usando a ferramenta generateQuote."
+        systemInstruction: "Você é o assistente virtual da oficina. Siga rigorosamente o catálogo de serviços e peças. Não invente serviços. Siga o fluxo: entenda o problema, pergunte se quer orçamento, e se sim, gere usando a ferramenta generateQuote."
       }
     });
 
@@ -129,15 +137,14 @@ Histórico da conversa:\n`;
 
           // Find or create customer
           let customerId = null;
-          const customersRef = collection(db, 'customers');
-          const qCustomer = query(customersRef, where('tenantId', '==', tenantId), where('phone', '==', customerPhone));
+          const customersRef = collection(db, `tenants/${tenantId}/customers`);
+          const qCustomer = query(customersRef, where('phone', '==', customerPhone));
           const customerSnapshot = await getDocs(qCustomer);
           
           if (!customerSnapshot.empty) {
             customerId = customerSnapshot.docs[0].id;
           } else {
             const newCustomerRef = await addDoc(customersRef, {
-              tenantId,
               name: customerName || 'Cliente WhatsApp',
               phone: customerPhone,
               createdAt: serverTimestamp()
@@ -148,15 +155,14 @@ Histórico da conversa:\n`;
           // Find or create vehicle if make/model provided
           let vehicleId = null;
           if (args.vehicle_make && args.vehicle_model) {
-            const vehiclesRef = collection(db, 'vehicles');
-            const qVehicle = query(vehiclesRef, where('tenantId', '==', tenantId), where('customerId', '==', customerId), where('make', '==', args.vehicle_make), where('model', '==', args.vehicle_model));
+            const vehiclesRef = collection(db, `tenants/${tenantId}/vehicles`);
+            const qVehicle = query(vehiclesRef, where('customerId', '==', customerId), where('make', '==', args.vehicle_make), where('model', '==', args.vehicle_model));
             const vehicleSnapshot = await getDocs(qVehicle);
             
             if (!vehicleSnapshot.empty) {
               vehicleId = vehicleSnapshot.docs[0].id;
             } else {
               const newVehicleRef = await addDoc(vehiclesRef, {
-                tenantId,
                 customerId,
                 make: args.vehicle_make,
                 model: args.vehicle_model,
@@ -169,9 +175,8 @@ Histórico da conversa:\n`;
           }
 
           // Create quote
-          const quotesRef = collection(db, 'quotes');
+          const quotesRef = collection(db, `tenants/${tenantId}/quotes`);
           await addDoc(quotesRef, {
-            tenantId,
             customerId,
             vehicleId,
             items,
@@ -480,21 +485,39 @@ async function startServer() {
 
       const servicesRef = collection(db, `tenants/${tenantId}/services`);
       const partsRef = collection(db, `tenants/${tenantId}/parts`);
-      const [servicesSnap, partsSnap] = await Promise.all([
+      const aiSettingsRef = doc(db, `tenants/${tenantId}/settings`, 'ai_assistant');
+      
+      const [servicesSnap, partsSnap, aiSettingsSnap] = await Promise.all([
         getDocs(servicesRef),
-        getDocs(partsRef)
+        getDocs(partsRef),
+        getDoc(aiSettingsRef)
       ]);
+      
       const catalog = {
         services: servicesSnap.docs.map(doc => ({ id: doc.id, ...doc.data() } as any)),
         parts: partsSnap.docs.map(doc => ({ id: doc.id, ...doc.data() } as any))
       };
+      
+      const aiSettings = aiSettingsSnap.exists() ? aiSettingsSnap.data() : null;
+      const customBehavior = aiSettings?.behavior ? `\nComportamento Customizado:\n${aiSettings.behavior}\n` : '';
 
       const messagesRef = collection(db, `whatsapp_conversations/${convId}/messages`);
       const qMessages = query(messagesRef, orderBy('timestamp', 'asc'));
       const msgsSnap = await getDocs(qMessages);
       const messages = msgsSnap.docs.map(doc => ({ id: doc.id, ...doc.data() } as any));
 
-      let prompt = "Analise a conversa abaixo e extraia os serviços, peças e o modelo/marca do veículo mencionados pelo cliente para gerar um orçamento.\n\nConversa:\n";
+      let prompt = `Analise a conversa abaixo e extraia os serviços, peças e o modelo/marca do veículo mencionados pelo cliente para gerar um orçamento.
+
+Informações da Oficina (CATÁLOGO RESTRITO):
+- Serviços Disponíveis: ${catalog.services.length > 0 ? catalog.services.map(s => s.name).join(', ') : 'Nenhum serviço cadastrado no momento.'}
+- Peças em Estoque: ${catalog.parts.length > 0 ? catalog.parts.map(p => p.name).join(', ') : 'Nenhuma peça cadastrada no momento.'}
+${customBehavior}
+Diretrizes CRÍTICAS:
+1. VOCÊ SÓ PODE INCLUIR NO ORÇAMENTO OS SERVIÇOS E PEÇAS LISTADOS ACIMA.
+2. Se o cliente pedir algo que não está na lista, NÃO inclua no orçamento.
+3. Se não houver serviços claros na conversa que correspondam ao catálogo, não gere o orçamento.
+
+Conversa:\n`;
       const recentMsgs = messages.slice(-20);
       recentMsgs.forEach(msg => {
         prompt += `${msg.direction === 'inbound' ? 'Cliente' : 'Oficina'}: ${msg.content}\n`;
@@ -505,7 +528,7 @@ async function startServer() {
         contents: prompt,
         config: {
           tools: [{ functionDeclarations: [generateQuoteFunctionDeclaration] }],
-          systemInstruction: "Você é um assistente de oficina. Use a ferramenta generateQuote para criar um orçamento baseado na conversa. Se não houver serviços claros, infira os mais prováveis (ex: Revisão Geral)."
+          systemInstruction: "Você é um assistente de oficina. Use a ferramenta generateQuote para criar um orçamento baseado na conversa. Siga rigorosamente o catálogo de serviços e peças."
         }
       });
 
@@ -545,15 +568,14 @@ async function startServer() {
             }
 
             let customerId = null;
-            const customersRef = collection(db, 'customers');
-            const qCustomer = query(customersRef, where('tenantId', '==', tenantId), where('phone', '==', customerPhone));
+            const customersRef = collection(db, `tenants/${tenantId}/customers`);
+            const qCustomer = query(customersRef, where('phone', '==', customerPhone));
             const customerSnapshot = await getDocs(qCustomer);
             
             if (!customerSnapshot.empty) {
               customerId = customerSnapshot.docs[0].id;
             } else {
               const newCustomerRef = await addDoc(customersRef, {
-                tenantId,
                 name: customerName || 'Cliente WhatsApp',
                 phone: customerPhone,
                 createdAt: serverTimestamp()
@@ -563,15 +585,14 @@ async function startServer() {
 
             let vehicleId = null;
             if (args.vehicle_make && args.vehicle_model) {
-              const vehiclesRef = collection(db, 'vehicles');
-              const qVehicle = query(vehiclesRef, where('tenantId', '==', tenantId), where('customerId', '==', customerId), where('make', '==', args.vehicle_make), where('model', '==', args.vehicle_model));
+              const vehiclesRef = collection(db, `tenants/${tenantId}/vehicles`);
+              const qVehicle = query(vehiclesRef, where('customerId', '==', customerId), where('make', '==', args.vehicle_make), where('model', '==', args.vehicle_model));
               const vehicleSnapshot = await getDocs(qVehicle);
               
               if (!vehicleSnapshot.empty) {
                 vehicleId = vehicleSnapshot.docs[0].id;
               } else {
                 const newVehicleRef = await addDoc(vehiclesRef, {
-                  tenantId,
                   customerId,
                   make: args.vehicle_make,
                   model: args.vehicle_model,
@@ -583,9 +604,8 @@ async function startServer() {
               }
             }
 
-            const quotesRef = collection(db, 'quotes');
+            const quotesRef = collection(db, `tenants/${tenantId}/quotes`);
             await addDoc(quotesRef, {
-              tenantId,
               customerId,
               vehicleId,
               items,
